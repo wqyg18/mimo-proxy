@@ -25,17 +25,25 @@ node index.js
 
 ### 3. 配置 Claude Code
 
-在 `~/.zshrc` 中修改：
+在 `~/.zshrc` 中添加以下环境变量：
 
 ```bash
 # 指向本地 proxy
 export ANTHROPIC_BASE_URL="http://localhost:8080/anthropic"
 
-# 这行可以保留也可以删掉，proxy 会自己加 key
-# export ANTHROPIC_AUTH_TOKEN="$MIMO_API_KEY"
+# API key（proxy 会自动注入，这里随便填一个非空值即可）
+export ANTHROPIC_AUTH_TOKEN="sk-placeholder"
+
+# 指定模型（必须，否则 Claude Code 会用默认的 Claude 模型名）
+export ANTHROPIC_MODEL="mimo-v2.5-pro[1m]"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="mimo-v2.5-pro[1m]"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="mimo-v2.5-pro[1m]"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="mimo-v2.5-pro[1m]"
 ```
 
 然后 `source ~/.zshrc` 并重启 Claude Code。
+
+> **为什么需要设置这么多模型变量？** Claude Code 内部会根据任务类型自动选择 Sonnet/Opus/Haiku，如果不把这些都指向 MIMO 的模型，某些任务会 fallback 到真实的 Claude API 导致失败。
 
 ## 功能
 
