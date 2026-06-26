@@ -26,6 +26,7 @@ try {
 
 // 失败后冷却时间（毫秒）
 const COOLDOWN_MS = 60_000;
+const REQUEST_TIMEOUT = 120_000; // 2 分钟
 
 // ============ Key 管理 ============
 
@@ -117,7 +118,7 @@ function makeRequest(targetUrl, method, headers, body) {
     });
 
     req.on('error', reject);
-    req.setTimeout(300_000, () => {
+    req.setTimeout(REQUEST_TIMEOUT, () => {
       req.destroy(new Error('timeout'));
     });
 
@@ -138,10 +139,12 @@ async function handleRequest(clientReq, clientRes) {
 
   const targetPath = clientReq.url;
   const maxAttempts = Math.min(keyStates.length, 3);
+  let attempt = 0;
 
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+  while (attempt < maxAttempts) {
     const keyState = getNextKey();
     const keyPreview = keyState.key.slice(0, 12) + '...';
+    attempt++;
 
     // 构造发往小米的 headers
     const targetHeaders = {
@@ -157,7 +160,7 @@ async function handleRequest(clientReq, clientRes) {
     }
 
     const targetUrl = `https://${TARGET_HOST}${targetPath}`;
-    log(`[${attempt + 1}/${maxAttempts}] ${clientReq.method} ${targetPath} → key${keyState.index} (${keyPreview})`);
+    log(`[${attempt}/${maxAttempts}] ${clientReq.method} ${targetPath} → key${keyState.index} (${keyPreview})`);
 
     try {
       const proxyRes = await makeRequest(targetUrl, clientReq.method, targetHeaders, body);
@@ -255,3 +258,17 @@ server.listen(PORT, () => {
   log(`  export ANTHROPIC_BASE_URL="http://localhost:${PORT}/anthropic"`);
   log(`  # 移除或保留 ANTHROPIC_AUTH_TOKEN 都行，proxy 会自己加`);
 });
+
+// 优雅退出
+function shutdown(signal) {
+  log(`收到 ${signal}，正在关闭...`);
+  server.close(() => {
+    log('服务器已关闭');
+    process.exit(0);
+  });
+  // 5 秒后强制退出
+  setTimeout(() => process.exit(1), 5000);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
