@@ -27,6 +27,7 @@ try {
 // 失败后冷却时间（毫秒）
 const COOLDOWN_MS = 60_000;
 const REQUEST_TIMEOUT = 120_000; // 2 分钟
+const RETRY_PER_KEY = 3; // 同一个 key 最多重试几次
 
 // ============ Key 管理 ============
 
@@ -138,77 +139,82 @@ async function handleRequest(clientReq, clientRes) {
   const body = Buffer.concat(chunks);
 
   const targetPath = clientReq.url;
-  const maxAttempts = Math.min(keyStates.length, 3);
-  let attempt = 0;
+  const maxKeySwitches = Math.min(keyStates.length, 3);
 
-  while (attempt < maxAttempts) {
+  for (let keyAttempt = 0; keyAttempt < maxKeySwitches; keyAttempt++) {
     const keyState = getNextKey();
     const keyPreview = keyState.key.slice(0, 12) + '...';
-    attempt++;
 
-    // 构造发往小米的 headers
-    const targetHeaders = {
-      'content-type': clientReq.headers['content-type'] || 'application/json',
-      'x-api-key': keyState.key,
-      'authorization': `Bearer ${keyState.key}`,
-      'anthropic-version': clientReq.headers['anthropic-version'] || '2023-06-01',
-    };
+    // 同一个 key 先重试几次
+    for (let retry = 0; retry < RETRY_PER_KEY; retry++) {
+      // 构造发往小米的 headers
+      const targetHeaders = {
+        'content-type': clientReq.headers['content-type'] || 'application/json',
+        'x-api-key': keyState.key,
+        'authorization': `Bearer ${keyState.key}`,
+        'anthropic-version': clientReq.headers['anthropic-version'] || '2023-06-01',
+      };
 
-    // 保留一些有用的 headers
-    if (clientReq.headers['anthropic-beta']) {
-      targetHeaders['anthropic-beta'] = clientReq.headers['anthropic-beta'];
-    }
+      // 保留一些有用的 headers
+      if (clientReq.headers['anthropic-beta']) {
+        targetHeaders['anthropic-beta'] = clientReq.headers['anthropic-beta'];
+      }
 
-    const targetUrl = `https://${TARGET_HOST}${targetPath}`;
-    log(`[${attempt}/${maxAttempts}] ${clientReq.method} ${targetPath} → key${keyState.index} (${keyPreview})`);
+      const targetUrl = `https://${TARGET_HOST}${targetPath}`;
+      log(`key${keyState.index} (${keyPreview}) 重试 ${retry + 1}/${RETRY_PER_KEY} | ${clientReq.method} ${targetPath}`);
 
-    try {
-      const proxyRes = await makeRequest(targetUrl, clientReq.method, targetHeaders, body);
+      try {
+        const proxyRes = await makeRequest(targetUrl, clientReq.method, targetHeaders, body);
 
-      // 如果是无效 key (401)，直接删除
-      if (isInvalidKey(proxyRes.statusCode)) {
-        proxyRes.resume();
-        removeKey(keyState);
-        if (keyStates.length === 0) {
-          log('  ↳ 没有可用 key 了！');
-          clientRes.writeHead(502, { 'content-type': 'application/json' });
-          clientRes.end(JSON.stringify({
-            error: { message: 'All keys are invalid', type: 'proxy_error' }
-          }));
-          return;
+        // 如果是无效 key (401)，直接删除，换下一个 key
+        if (isInvalidKey(proxyRes.statusCode)) {
+          proxyRes.resume();
+          removeKey(keyState);
+          if (keyStates.length === 0) {
+            log('  ↳ 没有可用 key 了！');
+            clientRes.writeHead(502, { 'content-type': 'application/json' });
+            clientRes.end(JSON.stringify({
+              error: { message: 'All keys are invalid', type: 'proxy_error' }
+            }));
+            return;
+          }
+          break; // 跳出重试循环，换下一个 key
         }
-        // 用下一个 key 重试，不消耗 attempt
-        attempt--;
-        continue;
-      }
 
-      // 如果是可重试的临时错误，换 key
-      if (isRetriableStatus(proxyRes.statusCode)) {
-        // 消费掉响应体
-        proxyRes.resume();
+        // 如果是可重试的临时错误，用同一个 key 重试
+        if (isRetriableStatus(proxyRes.statusCode)) {
+          proxyRes.resume();
+          log(`  ↳ ${proxyRes.statusCode}，${retry < RETRY_PER_KEY - 1 ? '重试中...' : '换 key...'}`);
+          if (retry < RETRY_PER_KEY - 1) {
+            await sleep(1000 * (retry + 1)); // 等一下再重试
+            continue;
+          }
+          markFailed(keyState);
+          break; // 重试次数用完，换 key
+        }
+
+        // 成功或不可重试的错误，透传给客户端
+        markSuccess(keyState);
+        log(`  ↳ ${proxyRes.statusCode} OK`);
+
+        // 构造响应 headers
+        const resHeaders = { ...proxyRes.headers };
+        delete resHeaders['transfer-encoding'];
+
+        clientRes.writeHead(proxyRes.statusCode, resHeaders);
+
+        // 流式透传
+        proxyRes.pipe(clientRes);
+        return;
+
+      } catch (err) {
+        log(`  ↳ 请求异常: ${err.message}`);
+        if (retry < RETRY_PER_KEY - 1) {
+          await sleep(1000 * (retry + 1));
+          continue;
+        }
         markFailed(keyState);
-        log(`  ↳ ${proxyRes.statusCode}，切换 key...`);
-        continue;
       }
-
-      // 成功或不可重试的错误，透传给客户端
-      markSuccess(keyState);
-      log(`  ↳ ${proxyRes.statusCode} OK`);
-
-      // 构造响应 headers
-      const resHeaders = { ...proxyRes.headers };
-      // 移除一些不应该透传的 headers
-      delete resHeaders['transfer-encoding'];
-
-      clientRes.writeHead(proxyRes.statusCode, resHeaders);
-
-      // 流式透传
-      proxyRes.pipe(clientRes);
-      return;
-
-    } catch (err) {
-      markFailed(keyState);
-      log(`  ↳ 请求异常: ${err.message}`);
     }
   }
 
@@ -220,6 +226,10 @@ async function handleRequest(clientReq, clientRes) {
       type: 'proxy_error',
     }
   }));
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 // ============ 启动服务器 ============
