@@ -10,11 +10,16 @@
 
 ```json
 [
-  "tp-key1...",
-  "tp-key2...",
-  "tp-key3..."
+  { "key": "tp-key1...", "endpoint": "cn" },
+  { "key": "tp-key2...", "endpoint": "sgp" }
 ]
 ```
+
+支持的 endpoint：
+- `cn` — 国内节点 `token-plan-cn.xiaomimimo.com`
+- `sgp` — 新加坡节点 `token-plan-sgp.xiaomimimo.com`
+
+也兼容旧格式（纯字符串数组），默认走 cn 节点。
 
 ### 2. 启动 proxy
 
@@ -47,6 +52,7 @@ export ANTHROPIC_DEFAULT_HAIKU_MODEL="mimo-v2.5-pro[1m]"
 
 ## 功能
 
+- **多节点支持** - CN / SGP 节点自动路由，每个 key 独立指定节点
 - **自动切换 key** - 遇到 401/429/5xx 自动换下一个 key
 - **冷却期** - 失败的 key 会暂时跳过，指数退避（最多 5 分钟）
 - **健康检查** - `curl http://localhost:8080/health` 查看所有 key 状态
@@ -72,4 +78,9 @@ curl http://localhost:8080/anthropic/v1/messages \
     "max_tokens": 100,
     "messages": [{"role": "user", "content": "hi"}]
   }'
+
+# 测试单个 key（支持 base64 自动解码，401 时自动尝试另一节点）
+node test-key.js tp-xxx              # 默认 cn 节点
+node test-key.js tp-xxx sgp          # 指定 sgp 节点
+node test-key.js dHAtYz...           # base64 输入，自动解码
 ```

@@ -1,4 +1,10 @@
 [
-  "tp-cqjs51zja6h249471u16to0h0z4kw1dlxwnx0ipltmvdkc5h",
-  "tp-ct1luibp8q8wp071v5aom22dph0fbrqgtrjbczo59y3lbvqg"
+  { "key": "tp-cqjs51zja6h249471u16to0h0z4kw1dlxwnx0ipltmvdkc5h", "endpoint": "cn" },
+  { "key": "tp-ct1luibp8q8wp071v5aom22dph0fbrqgtrjbczo59y3lbvqg", "endpoint": "cn" },
+  { "key": "tp-cny4x6jyde99h0gwtu61zmt2l60ixe7f9i0xrj5z4bgjsx55", "endpoint": "cn" },
+  { "key": "tp-cwih25mi02i1p0ngqle5hfmxw9dh84925ou85a8w456wr0nc", "endpoint": "cn" },
+  { "key": "tp-cna5mh5h3xjqaij7j38uwp05h2nn9awj2qj058cq9yleovtp", "endpoint": "cn" },
+  { "key": "tp-ssd3m5s0g2t3537b06nsnciozwuguofl9xwexn5ozhmfnmcu", "endpoint": "sgp" },
+  { "key": "tp-cv95ztcaydf07waysgt28ru2ed7c20br7jdqhaw37odft9lh", "endpoint": "cn" },
+  { "key": "tp-cqe5t21brxwh16ja13tc8nhjfmuy122hs0sx2s57r0evgd2n", "endpoint": "cn" }
 ]

@@ -7,17 +7,31 @@ const path = require('path');
 // ============ 配置 ============
 
 const PORT = process.env.MIMO_PROXY_PORT || 8080;
-const TARGET_HOST = 'token-plan-cn.xiaomimimo.com';
 
-// 从 keys.json 读取
+// 节点映射
+const ENDPOINTS = {
+  cn:  'token-plan-cn.xiaomimimo.com',
+  sgp: 'token-plan-sgp.xiaomimimo.com',
+};
+
+// 从 keys.json 读取，兼容旧格式（纯字符串数组）和新格式（对象数组）
 const KEYS_FILE = path.join(__dirname, 'keys.json');
 let KEYS = [];
 
 try {
-  KEYS = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8'));
-  if (!Array.isArray(KEYS) || KEYS.length === 0) {
+  const raw = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8'));
+  if (!Array.isArray(raw) || raw.length === 0) {
     throw new Error('keys.json must be a non-empty array');
   }
+  KEYS = raw.map((entry) => {
+    if (typeof entry === 'string') {
+      return { key: entry, endpoint: 'cn' };
+    }
+    if (!entry.key || !ENDPOINTS[entry.endpoint]) {
+      throw new Error(`Invalid entry: ${JSON.stringify(entry)}`);
+    }
+    return { key: entry.key, endpoint: entry.endpoint };
+  });
 } catch (err) {
   console.error(`Failed to load keys.json: ${err.message}`);
   console.error('Please create keys.json with an array of API keys');
@@ -31,8 +45,10 @@ const RETRY_PER_KEY = 3; // 同一个 key 最多重试几次
 
 // ============ Key 管理 ============
 
-const keyStates = KEYS.map((key, i) => ({
-  key,
+const keyStates = KEYS.map((entry, i) => ({
+  key: entry.key,
+  host: ENDPOINTS[entry.endpoint],
+  endpoint: entry.endpoint,
   index: i,
   failCount: 0,
   cooldownUntil: 0,
@@ -72,14 +88,14 @@ function markFailed(keyState) {
   if (idx !== -1) {
     currentIndex = (idx + 1) % keyStates.length;
   }
-  log(`Key ${keyState.index} 失败 (累计${keyState.failCount}次)，冷却 ${Math.round(cooldown / 1000)}s`);
+  log(`Key ${keyState.index} (${keyState.endpoint}) 失败 (累计${keyState.failCount}次)，冷却 ${Math.round(cooldown / 1000)}s`);
 }
 
 function removeKey(keyState) {
   const idx = keyStates.indexOf(keyState);
   if (idx !== -1) {
     keyStates.splice(idx, 1);
-    log(`Key ${keyState.index} (${keyState.key.slice(0, 12)}...) 已失效，已从池中移除，剩余 ${keyStates.length} 个 key`);
+    log(`Key ${keyState.index} (${keyState.endpoint}) ${keyState.key.slice(0, 12)}... 已失效，已从池中移除，剩余 ${keyStates.length} 个 key`);
   }
   // 调整 currentIndex 防止越界
   if (currentIndex >= keyStates.length) {
@@ -109,13 +125,12 @@ function isInvalidKey(code) {
   return code === 401;
 }
 
-function makeRequest(targetUrl, method, headers, body) {
+function makeRequest(host, path, method, headers, body) {
   return new Promise((resolve, reject) => {
-    const url = new URL(targetUrl);
     const options = {
-      hostname: url.hostname,
+      hostname: host,
       port: 443,
-      path: url.pathname + url.search,
+      path,
       method,
       headers,
     };
@@ -166,11 +181,10 @@ async function handleRequest(clientReq, clientRes) {
         targetHeaders['anthropic-beta'] = clientReq.headers['anthropic-beta'];
       }
 
-      const targetUrl = `https://${TARGET_HOST}${targetPath}`;
-      log(`key${keyState.index} (${keyPreview}) 重试 ${retry + 1}/${RETRY_PER_KEY} | ${clientReq.method} ${targetPath}`);
+      log(`key${keyState.index} (${keyState.endpoint}) ${keyPreview} 重试 ${retry + 1}/${RETRY_PER_KEY} | ${clientReq.method} ${targetPath}`);
 
       try {
-        const proxyRes = await makeRequest(targetUrl, clientReq.method, targetHeaders, body);
+        const proxyRes = await makeRequest(keyState.host, targetPath, clientReq.method, targetHeaders, body);
 
         // 如果是无效 key (401)，直接删除，换下一个 key
         if (isInvalidKey(proxyRes.statusCode)) {
@@ -248,6 +262,7 @@ const server = http.createServer((req, res) => {
       status: 'ok',
       keys: keyStates.map(k => ({
         index: k.index,
+        endpoint: k.endpoint,
         preview: k.key.slice(0, 12) + '...',
         fails: k.failCount,
         cooldown: k.cooldownUntil > Date.now() ? Math.round((k.cooldownUntil - Date.now()) / 1000) + 's' : 'none',
@@ -266,9 +281,11 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => {
+  const cnCount = keyStates.filter(k => k.endpoint === 'cn').length;
+  const sgpCount = keyStates.filter(k => k.endpoint === 'sgp').length;
   log(`MIMO Proxy 已启动 → http://localhost:${PORT}`);
-  log(`管理 ${KEYS.length} 个 key`);
-  log(`目标: ${TARGET_HOST}`);
+  log(`管理 ${KEYS.length} 个 key (CN: ${cnCount}, SGP: ${sgpCount})`);
+  log(`节点: CN=${ENDPOINTS.cn}, SGP=${ENDPOINTS.sgp}`);
   log('');
   log('Claude Code 配置:');
   log(`  export ANTHROPIC_BASE_URL="http://localhost:${PORT}/anthropic"`);

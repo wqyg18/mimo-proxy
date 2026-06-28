@@ -1,12 +1,22 @@
 #!/usr/bin/env node
 const https = require('https');
 
-const TARGET = 'token-plan-cn.xiaomimimo.com';
+const ENDPOINTS = {
+  cn:  'token-plan-cn.xiaomimimo.com',
+  sgp: 'token-plan-sgp.xiaomimimo.com',
+};
 const MODEL = 'mimo-v2.5-pro';
 
 let input = process.argv[2];
+let endpoint = process.argv[3] || 'cn';
+
 if (!input) {
-  console.error('用法: node test-key.js <key 或 base64>');
+  console.error('用法: node test-key.js <key 或 base64> [cn|sgp]');
+  process.exit(1);
+}
+
+if (!ENDPOINTS[endpoint]) {
+  console.error('endpoint 必须是 cn 或 sgp');
   process.exit(1);
 }
 
@@ -27,43 +37,69 @@ if (!/^tp-[a-z0-9]{48}$/.test(input)) {
   process.exit(1);
 }
 
-console.log('测试 key:', input.slice(0, 16) + '...');
-console.log('模型:', MODEL);
-console.log('');
+function test(host) {
+  return new Promise((resolve) => {
+    const body = JSON.stringify({
+      model: MODEL,
+      max_tokens: 1,
+      messages: [{ role: 'user', content: 'hi' }]
+    });
 
-const body = JSON.stringify({
-  model: MODEL,
-  max_tokens: 1,
-  messages: [{ role: 'user', content: 'hi' }]
-});
+    const req = https.request({
+      hostname: host,
+      port: 443,
+      path: '/anthropic/v1/messages',
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': input,
+        'authorization': 'Bearer ' + input,
+        'anthropic-version': '2023-06-01',
+      },
+    }, (res) => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => resolve({ status: res.statusCode, body: d }));
+    });
 
-const req = https.request({
-  hostname: TARGET,
-  port: 443,
-  path: '/anthropic/v1/messages',
-  method: 'POST',
-  headers: {
-    'content-type': 'application/json',
-    'x-api-key': input,
-    'authorization': 'Bearer ' + input,
-    'anthropic-version': '2023-06-01',
-  },
-}, (res) => {
-  let d = '';
-  res.on('data', c => d += c);
-  res.on('end', () => {
-    console.log('HTTP', res.statusCode);
-    if (res.statusCode === 200 || res.statusCode === 429) {
-      console.log('✅ Key 有效' + (res.statusCode === 429 ? '（限流中）' : ''));
-    } else if (res.statusCode === 401) {
-      console.log('❌ Key 无效');
-    } else {
-      console.log('⚠️  其他状态:', d.slice(0, 200));
-    }
+    req.on('error', e => resolve({ status: 'ERROR', body: e.message }));
+    req.setTimeout(15000, () => { req.destroy(); resolve({ status: 'TIMEOUT', body: '' }); });
+    req.write(body);
+    req.end();
   });
-});
+}
 
-req.on('error', e => console.log('❌ 请求失败:', e.message));
-req.setTimeout(15000, () => { req.destroy(); console.log('❌ 超时'); });
-req.write(body);
-req.end();
+function report(ep, result) {
+  const host = ENDPOINTS[ep];
+  console.log(`\n[${ep}] ${host}`);
+  console.log('HTTP', result.status);
+  if (result.status === 200 || result.status === 429) {
+    console.log('✅ Key 有效' + (result.status === 429 ? '（限流中）' : ''));
+    return true;
+  } else if (result.status === 401) {
+    console.log('❌ Key 无效');
+    return false;
+  } else {
+    console.log('⚠️  其他状态:', result.body.slice(0, 200));
+    return false;
+  }
+}
+
+(async () => {
+  console.log('测试 key:', input.slice(0, 16) + '...');
+  console.log('模型:', MODEL);
+
+  const result = await test(ENDPOINTS[endpoint]);
+  const ok = report(endpoint, result);
+
+  // 如果指定节点失败（401），自动尝试另一个节点
+  if (!ok && result.status === 401) {
+    const other = endpoint === 'cn' ? 'sgp' : 'cn';
+    console.log(`\n自动尝试 ${other} 节点...`);
+    const otherResult = await test(ENDPOINTS[other]);
+    const otherOk = report(other, otherResult);
+    if (otherOk) {
+      console.log(`\n💡 此 key 属于 ${other} 节点`);
+    }
+  }
+})();
