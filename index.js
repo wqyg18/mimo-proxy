@@ -52,12 +52,13 @@ function getNextKey() {
       continue; // 还在冷却中
     }
 
-    currentIndex = (idx + 1) % total; // 下次从下一个开始
+    currentIndex = idx; // 保持在当前可用 key，不自动推进
     return state;
   }
 
   // 所有 key 都在冷却，选一个冷却时间最短的
   keyStates.sort((a, b) => a.cooldownUntil - b.cooldownUntil);
+  currentIndex = keyStates[0].index;
   return keyStates[0];
 }
 
@@ -66,6 +67,11 @@ function markFailed(keyState) {
   // 指数退避，最多 5 分钟
   const cooldown = Math.min(COOLDOWN_MS * Math.pow(2, keyState.failCount - 1), 300_000);
   keyState.cooldownUntil = Date.now() + cooldown;
+  // 轮换到下一个 key
+  const idx = keyStates.indexOf(keyState);
+  if (idx !== -1) {
+    currentIndex = (idx + 1) % keyStates.length;
+  }
   log(`Key ${keyState.index} 失败 (累计${keyState.failCount}次)，冷却 ${Math.round(cooldown / 1000)}s`);
 }
 
