@@ -41,54 +41,197 @@ try {
 // 失败后冷却时间（毫秒）
 const COOLDOWN_MS = 60_000;
 const REQUEST_TIMEOUT = 120_000; // 2 分钟
-const RETRY_PER_KEY = 3; // 同一个 key 最多重试几次
+const BASE_RETRY_PER_KEY = 3; // 基础重试次数
+const MAX_RETRY_PER_KEY = 6; // 高权重 key 最多重试次数
+const SUCCESS_WINDOW_MS = 10 * 60 * 1000; // 10 分钟内的成功视为"近期"
+const STALE_THRESHOLD_MS = 5 * 60 * 1000; // 超过 5 分钟没成功视为"不活跃"
+const MIN_WEIGHT = 0.05; // 最低权重，保证每个 key 都有机会
+
+// ============ 持久化统计 ============
+
+const STATS_FILE = path.join(__dirname, 'key-stats.json');
+
+function loadKeyStats() {
+  try {
+    const data = JSON.parse(fs.readFileSync(STATS_FILE, 'utf8'));
+    return data.keys || {};
+  } catch {
+    return {};
+  }
+}
+
+function saveKeyStats() {
+  const keys = {};
+  for (const s of keyStates) {
+    const id = s.key.slice(0, 12);
+    keys[id] = {
+      totalSuccess: s.totalSuccess,
+      totalRequests: s.totalRequests,
+      lastSuccessAt: s.lastSuccessAt,
+      endpoint: s.endpoint,
+    };
+  }
+  try {
+    fs.writeFileSync(STATS_FILE, JSON.stringify({ lastSaved: new Date().toISOString(), keys }, null, 2));
+    log(`Key 统计已保存到 key-stats.json`);
+  } catch (err) {
+    log(`保存统计失败: ${err.message}`);
+  }
+}
 
 // ============ Key 管理 ============
 
-const keyStates = KEYS.map((entry, i) => ({
+// 按上次运行的质量排序：成功率高的排前面
+const savedStats = loadKeyStats();
+const sortedKeys = [...KEYS].sort((a, b) => {
+  const idA = a.key.slice(0, 12);
+  const idB = b.key.slice(0, 12);
+  const statA = savedStats[idA];
+  const statB = savedStats[idB];
+  // 有历史记录的优先，按成功率降序
+  if (statA && statB) {
+    const rateA = statA.totalRequests > 0 ? statA.totalSuccess / statA.totalRequests : 0;
+    const rateB = statB.totalRequests > 0 ? statB.totalSuccess / statB.totalRequests : 0;
+    return rateB - rateA;
+  }
+  if (statA) return -1; // A 有记录，排前面
+  if (statB) return 1;
+  return 0; // 都没记录，保持原序
+});
+
+if (Object.keys(savedStats).length > 0) {
+  log(`已加载 key 历史统计，按质量排序：`);
+  sortedKeys.forEach((e, i) => {
+    const id = e.key.slice(0, 12);
+    const stat = savedStats[id];
+    if (stat) {
+      const rate = stat.totalRequests > 0 ? Math.round(stat.totalSuccess / stat.totalRequests * 100) : 0;
+      log(`  ${i + 1}. ${id}... (${e.endpoint}) 成功率 ${rate}% (${stat.totalSuccess}/${stat.totalRequests})`);
+    } else {
+      log(`  ${i + 1}. ${id}... (${e.endpoint}) 新 key`);
+    }
+  });
+}
+
+const keyStates = sortedKeys.map((entry, i) => ({
   key: entry.key,
   host: ENDPOINTS[entry.endpoint],
   endpoint: entry.endpoint,
   index: i,
   failCount: 0,
   cooldownUntil: 0,
+  // 成功统计（从历史恢复）
+  totalSuccess: (savedStats[entry.key.slice(0, 12)] || {}).totalSuccess || 0,
+  totalRequests: (savedStats[entry.key.slice(0, 12)] || {}).totalRequests || 0,
+  recentSuccesses: 0,    // 近期窗口内的成功次数（每次启动重新计算）
+  recentRequests: 0,     // 近期窗口内的总请求次数
+  lastSuccessAt: (savedStats[entry.key.slice(0, 12)] || {}).lastSuccessAt || 0,
+  lastRequestAt: 0,
 }));
 
-let currentIndex = 0;
+// 近期统计的滑动窗口清理
+setInterval(() => {
+  const now = Date.now();
+  for (const s of keyStates) {
+    // 如果最近一次成功超过窗口期，衰减近期计数
+    if (s.lastSuccessAt > 0 && now - s.lastSuccessAt > SUCCESS_WINDOW_MS) {
+      s.recentSuccesses = Math.max(0, s.recentSuccesses - 1);
+      s.recentRequests = Math.max(0, s.recentRequests - 1);
+    }
+  }
+}, 60_000); // 每分钟清理一次
+
+function getKeyWeight(keyState) {
+  const now = Date.now();
+
+  // 冷却中的 key 权重为 0
+  if (keyState.cooldownUntil > now) return 0;
+
+  // 全新 key（从未请求过）给一个基础权重
+  if (keyState.totalRequests === 0) return 0.5;
+
+  // 计算近期成功率（近期有数据时优先用近期）
+  let successRate;
+  if (keyState.recentRequests >= 3) {
+    successRate = keyState.recentSuccesses / keyState.recentRequests;
+  } else {
+    // 近期数据不足，用全局成功率
+    successRate = keyState.totalSuccess / keyState.totalRequests;
+  }
+
+  // 近期活跃度加权：最近有成功的 key 更值得信赖
+  let recencyBoost = 1.0;
+  if (keyState.lastSuccessAt > 0) {
+    const timeSinceSuccess = now - keyState.lastSuccessAt;
+    if (timeSinceSuccess < STALE_THRESHOLD_MS) {
+      // 最近 5 分钟内有成功，给予加成
+      recencyBoost = 1.5;
+    } else if (timeSinceSuccess > SUCCESS_WINDOW_MS) {
+      // 超过 10 分钟没成功，降权
+      recencyBoost = 0.5;
+    }
+  }
+
+  const weight = Math.max(MIN_WEIGHT, successRate * recencyBoost);
+  return weight;
+}
+
+function getRetryCount(keyState) {
+  // 近期有成功的 key 给更多重试机会
+  if (keyState.lastSuccessAt > 0) {
+    const timeSinceSuccess = Date.now() - keyState.lastSuccessAt;
+    if (timeSinceSuccess < STALE_THRESHOLD_MS) {
+      return MAX_RETRY_PER_KEY; // 近期有成功，多给机会
+    }
+  }
+  // 近期成功率高的 key 也多给机会
+  if (keyState.recentRequests >= 3) {
+    const rate = keyState.recentSuccesses / keyState.recentRequests;
+    if (rate > 0.5) return Math.round(BASE_RETRY_PER_KEY + (MAX_RETRY_PER_KEY - BASE_RETRY_PER_KEY) * rate);
+  }
+  return BASE_RETRY_PER_KEY;
+}
 
 function getNextKey() {
   const now = Date.now();
-  const total = keyStates.length;
 
-  for (let i = 0; i < total; i++) {
-    const idx = (currentIndex + i) % total;
-    const state = keyStates[idx];
+  // 计算所有 key 的权重
+  const weights = keyStates.map(s => getKeyWeight(s));
+  const totalWeight = weights.reduce((a, b) => a + b, 0);
 
-    if (state.cooldownUntil > now) {
-      continue; // 还在冷却中
-    }
-
-    currentIndex = idx; // 保持在当前可用 key，不自动推进
-    return state;
+  if (totalWeight <= 0) {
+    // 所有 key 都在冷却，选一个冷却时间最短的
+    keyStates.sort((a, b) => a.cooldownUntil - b.cooldownUntil);
+    return keyStates[0];
   }
 
-  // 所有 key 都在冷却，选一个冷却时间最短的
-  keyStates.sort((a, b) => a.cooldownUntil - b.cooldownUntil);
-  currentIndex = keyStates[0].index;
-  return keyStates[0];
+  // 加权随机选择
+  let r = Math.random() * totalWeight;
+  for (let i = 0; i < keyStates.length; i++) {
+    r -= weights[i];
+    if (r <= 0) return keyStates[i];
+  }
+  return keyStates[keyStates.length - 1]; // 兜底
 }
 
 function markFailed(keyState) {
   keyState.failCount++;
-  // 指数退避，最多 5 分钟
-  const cooldown = Math.min(COOLDOWN_MS * Math.pow(2, keyState.failCount - 1), 300_000);
-  keyState.cooldownUntil = Date.now() + cooldown;
-  // 轮换到下一个 key
-  const idx = keyStates.indexOf(keyState);
-  if (idx !== -1) {
-    currentIndex = (idx + 1) % keyStates.length;
+  // 近期有成功的 key，冷却时间更短
+  let cooldownMultiplier = keyState.failCount - 1;
+  if (keyState.lastSuccessAt > 0) {
+    const timeSinceSuccess = Date.now() - keyState.lastSuccessAt;
+    if (timeSinceSuccess < STALE_THRESHOLD_MS) {
+      cooldownMultiplier = Math.max(0, cooldownMultiplier - 1); // 减少一级退避
+    }
   }
-  log(`Key ${keyState.index} (${keyState.endpoint}) 失败 (累计${keyState.failCount}次)，冷却 ${Math.round(cooldown / 1000)}s`);
+  const cooldown = Math.min(COOLDOWN_MS * Math.pow(2, cooldownMultiplier), 300_000);
+  keyState.cooldownUntil = Date.now() + cooldown;
+  keyState.totalRequests++;
+  keyState.recentRequests++;
+  keyState.lastRequestAt = Date.now();
+
+  const weight = getKeyWeight(keyState);
+  log(`Key ${keyState.index} (${keyState.endpoint}) 失败 (累计${keyState.failCount}次，权重${weight.toFixed(2)})，冷却 ${Math.round(cooldown / 1000)}s`);
 }
 
 function removeKey(keyState) {
@@ -97,15 +240,18 @@ function removeKey(keyState) {
     keyStates.splice(idx, 1);
     log(`Key ${keyState.index} (${keyState.endpoint}) ${keyState.key.slice(0, 12)}... 已失效，已从池中移除，剩余 ${keyStates.length} 个 key`);
   }
-  // 调整 currentIndex 防止越界
-  if (currentIndex >= keyStates.length) {
-    currentIndex = 0;
-  }
 }
 
 function markSuccess(keyState) {
+  const now = Date.now();
   keyState.failCount = 0;
   keyState.cooldownUntil = 0;
+  keyState.totalSuccess++;
+  keyState.totalRequests++;
+  keyState.recentSuccesses++;
+  keyState.recentRequests++;
+  keyState.lastSuccessAt = now;
+  keyState.lastRequestAt = now;
 }
 
 // ============ 日志 ============
@@ -160,14 +306,15 @@ async function handleRequest(clientReq, clientRes) {
   const body = Buffer.concat(chunks);
 
   const targetPath = clientReq.url;
-  const maxKeySwitches = Math.min(keyStates.length, 3);
+  const maxKeySwitches = Math.min(keyStates.length, 5);
 
   for (let keyAttempt = 0; keyAttempt < maxKeySwitches; keyAttempt++) {
     const keyState = getNextKey();
     const keyPreview = keyState.key.slice(0, 12) + '...';
 
-    // 同一个 key 先重试几次
-    for (let retry = 0; retry < RETRY_PER_KEY; retry++) {
+    // 根据 key 质量动态决定重试次数
+    const retryCount = getRetryCount(keyState);
+    for (let retry = 0; retry < retryCount; retry++) {
       // 构造发往小米的 headers
       const targetHeaders = {
         'content-type': clientReq.headers['content-type'] || 'application/json',
@@ -181,7 +328,7 @@ async function handleRequest(clientReq, clientRes) {
         targetHeaders['anthropic-beta'] = clientReq.headers['anthropic-beta'];
       }
 
-      log(`key${keyState.index} (${keyState.endpoint}) ${keyPreview} 重试 ${retry + 1}/${RETRY_PER_KEY} | ${clientReq.method} ${targetPath}`);
+      log(`key${keyState.index} (${keyState.endpoint}) ${keyPreview} 重试 ${retry + 1}/${retryCount} | ${clientReq.method} ${targetPath}`);
 
       try {
         const proxyRes = await makeRequest(keyState.host, targetPath, clientReq.method, targetHeaders, body);
@@ -204,8 +351,8 @@ async function handleRequest(clientReq, clientRes) {
         // 如果是可重试的临时错误，用同一个 key 重试
         if (isRetriableStatus(proxyRes.statusCode)) {
           proxyRes.resume();
-          log(`  ↳ ${proxyRes.statusCode}，${retry < RETRY_PER_KEY - 1 ? '重试中...' : '换 key...'}`);
-          if (retry < RETRY_PER_KEY - 1) {
+          log(`  ↳ ${proxyRes.statusCode}，${retry < retryCount - 1 ? '重试中...' : '换 key...'}`);
+          if (retry < retryCount - 1) {
             await sleep(1000 * (retry + 1)); // 等一下再重试
             continue;
           }
@@ -229,7 +376,7 @@ async function handleRequest(clientReq, clientRes) {
 
       } catch (err) {
         log(`  ↳ 请求异常: ${err.message}`);
-        if (retry < RETRY_PER_KEY - 1) {
+        if (retry < retryCount - 1) {
           await sleep(1000 * (retry + 1));
           continue;
         }
@@ -260,13 +407,21 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({
       status: 'ok',
-      keys: keyStates.map(k => ({
-        index: k.index,
-        endpoint: k.endpoint,
-        preview: k.key.slice(0, 12) + '...',
-        fails: k.failCount,
-        cooldown: k.cooldownUntil > Date.now() ? Math.round((k.cooldownUntil - Date.now()) / 1000) + 's' : 'none',
-      }))
+      keys: keyStates.map(k => {
+        const weight = getKeyWeight(k);
+        const retryCount = getRetryCount(k);
+        return {
+          index: k.index,
+          endpoint: k.endpoint,
+          preview: k.key.slice(0, 12) + '...',
+          weight: Math.round(weight * 100) / 100,
+          retries: retryCount,
+          fails: k.failCount,
+          successRate: k.totalRequests > 0 ? Math.round(k.totalSuccess / k.totalRequests * 100) + '%' : 'N/A',
+          recentRate: k.recentRequests > 0 ? Math.round(k.recentSuccesses / k.recentRequests * 100) + '%' : 'N/A',
+          cooldown: k.cooldownUntil > Date.now() ? Math.round((k.cooldownUntil - Date.now()) / 1000) + 's' : 'none',
+        };
+      })
     }));
     return;
   }
@@ -295,12 +450,16 @@ server.listen(PORT, () => {
 // 优雅退出
 function shutdown(signal) {
   log(`收到 ${signal}，正在关闭...`);
+  saveKeyStats(); // 保存 key 质量统计，下次启动时用
   server.close(() => {
     log('服务器已关闭');
     process.exit(0);
   });
   // 5 秒后强制退出
-  setTimeout(() => process.exit(1), 5000);
+  setTimeout(() => {
+    saveKeyStats(); // 再存一次，防止 server.close 卡住
+    process.exit(1);
+  }, 5000);
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
